@@ -1,6 +1,6 @@
 extern "C" {  
-    #include "include/lua.h"  
-    #include "include/lauxlib.h"  
+    #include "lua.h"  
+    #include "lauxlib.h"  
 }
 #include <string>
 #include <cstdlib>
