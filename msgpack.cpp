@@ -1,3 +1,32 @@
+/* msgpack4lua(https://github.com/Kohit/msgpack4lua)
+A simple yet fast c/c++ implementation of [MessagePack](https://msgpack.org/) for Lua
+
+Copyright (c) 2017 kohit(github.com/Kohit)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+reference:
+[msgpack-c](https://github.com/msgpack/msgpack-c), 
+[fperrad/lua-MessagePack](https://github.com/fperrad/lua-MessagePack),
+[mpx/lua-cjson](https://github.com/mpx/lua-cjson)
+*/
+
 extern "C" {  
     #include "lua.h"  
     #include "lauxlib.h"  
@@ -10,8 +39,9 @@ extern "C" {
 
 #define CHAR(x) static_cast<char>(x)
 #define U8(x) static_cast<uint8_t>(x)
-
-static const int max_depth = 80;
+#define REUSEBUF 1  // set 1 to enable reuse string buffer
+#define MAX_DEPTH 80
+#define DEFAULT_BUF_LENGTH 1024
 
 /* macros fome msgpack-c */
 #if defined(unix) || defined(__unix) || defined(__APPLE__) || defined(__OpenBSD__)
@@ -126,26 +156,36 @@ store
 // load obj.value: 1.load obj, 2.load obj.value 
 
 static int (*error)(lua_State * L, const char *fmt, ...) = luaL_error;
-// note: error never returned
+// note: error never returned, but the local variable will be removed(the destructor of local classes will be called)
 
-struct Parser{
-    const char *str;
-    size_t len = 0;
-    size_t idx = 0;
-    int depth = 0;
+struct Parser {
+	const char *str;
+	size_t len = 0;
+	size_t idx = 0;
+	int depth = 0;
 };
 struct strbuf {
-	char * str;
+	char * str = NULL;
 	size_t size = 0, len = 0;
-	lua_State * L;
-	strbuf(lua_State * l) {
+	lua_State * L = NULL;
+	strbuf(lua_State * l) {	init(l); }	// this won't be called if reuse buf
+	~strbuf() { destroy(); }	// this will be called after error being called, but won't be called if reuse buf
+	void destroy(){ if (str) free(str); }
+	void init(lua_State * l) {
 		L = l;
-		size = 1024;
+		size = DEFAULT_BUF_LENGTH;
+		len = 0;
 		str = (char *)malloc(size);
 		if (!str) error(L, "Out of memory\n");
 	}
-	~strbuf() { destroy(); }
-	void destroy() { if (str) free(str); size = 0; len = 0; str = NULL; }
+	void reset(lua_State * l) {	// reuse buf
+		if (!str) init(l);
+		else {
+			L = l;
+			len = 0;
+			// shrink();
+		}
+	}
 	void push_back(char c) {
 		if (size <= len) expand(size + 1);
 		str[len++] = c;
@@ -158,372 +198,449 @@ struct strbuf {
 	void expand(size_t count) {
 		size_t old = size;
 		size += count;
-		if (size < old) {
-			destroy();
-			error(L, "exceeded maximum string length.\n");
-		}
+		if (size < old) error(L, "exceeded maximum string length.\n");
 		str = (char *)realloc(str, size);
 		if (!str) error(L, "Out of memory\n");
 	}
 	inline size_t length() { return len; }
 	inline char * data() { return str; }
 };
+static int destroy_strbuf(lua_State * L) {
+	strbuf *buf = (strbuf *)lua_touserdata(L, 1);
+	if (buf) buf->destroy();
+	buf = NULL;
+	// strbuf will be removed by lua gc
+	return 0;
+}
+static strbuf* get_strbuf(lua_State * L) {
+	strbuf *buf = (strbuf *)lua_touserdata(L, lua_upvalueindex(1));
+	if (!buf) error(L, "fatal error:Unable to fetch string buffer");
+	return buf;
+}
 
-static void pack_str(lua_State * L, strbuf & buf){
 
-    size_t len = 0;
-    const char* str = lua_tolstring(L, -1, &len);
+static void pack_str(lua_State * L, strbuf & buf) {
 
-    if(len < 32) {
-        buf.push_back(CHAR(0xa0 | len));
-    } else if(len < 65536) {
-        char sbuf[3];
-        store16(sbuf, 0xda, len);
-        buf.append(sbuf, 3);
-    } else if(len <= 0xFFFFFFFFU) {
-        char sbuf[5];
-        store32(sbuf, 0xdb, len);
-        buf.append(sbuf, 5);
-    }else {
-		buf.destroy();
-		error(L, "exceeded maximum byte size of String object(2^32 - 1):%d", len);
+	size_t len = 0;
+	const char* str = lua_tolstring(L, -1, &len);
+
+	if (len < 32) {
+		buf.push_back(CHAR(0xa0 | len));
 	}
+	else if (len < 256) {
+		buf.push_back(CHAR(0xd9));
+		buf.push_back(U8(len));
+	}
+	else if (len < 65536) {
+		char sbuf[3];
+		store16(sbuf, 0xda, len);
+		buf.append(sbuf, 3);
+	}
+	else if (len <= 0xFFFFFFFFU) {
+		char sbuf[5];
+		store32(sbuf, 0xdb, len);
+		buf.append(sbuf, 5);
+	}
+	else 
+		error(L, "exceeded maximum byte size of String object(2^32 - 1):%d", len);
 
-    buf.append(str, len);
+	buf.append(str, len);
 }
 
 static void append_buffer(lua_State *, strbuf &, int);
 
 static void pack_map(lua_State * L, strbuf & buf, size_t len, int depth)
 {
-    if(len < 16) {
-        buf.push_back(CHAR(0x80 | len));
-    } else if(len < 65536) {
-        char sbuf[3];
-        store16(sbuf, 0xde, len);
-        buf.append(sbuf, 3);
-    } else if(len < (1LL << 32)) {   
-        char sbuf[5];
-        store32(sbuf, 0xdf, len);
-        buf.append(sbuf, 5);
-    }else {
-		buf.destroy();
-		error(L, "exceeded maximum number of Array object(2^32 - 1):%d", len);
+	if (len < 16) {
+		buf.push_back(CHAR(0x80 | len));
 	}
-    lua_pushnil(L);
-    /* table, nil */
-    while (lua_next(L, -2) != 0) {
-        /* table, key, value */
-        lua_pushvalue(L, -2);
-        /* table, key, value key*/                
-        append_buffer(L, buf, depth);
-        lua_pop(L, 1);
+	else if (len < 65536) {
+		char sbuf[3];
+		store16(sbuf, 0xde, len);
+		buf.append(sbuf, 3);
+	}
+	else if (len < (1LL << 32)) {
+		char sbuf[5];
+		store32(sbuf, 0xdf, len);
+		buf.append(sbuf, 5);
+	}
+	else 
+		error(L, "exceeded maximum number of Array object(2^32 - 1):%d", len);
+	
+	int is_cache = 0;
+	lua_getfield(L, -1, "_data");
+	if (lua_type(L, -1) == LUA_TNIL)
+		lua_pop(L, 1);
+	else
+		is_cache = 1;
 
-        /* table, key, value */
-        append_buffer(L, buf, depth);
-        lua_pop(L, 1);        
-        /* table, key */
-    }
+	lua_pushnil(L);
+	/* table, nil */
+	while (lua_next(L, -2) != 0) {
+		/* table, key, value */
+		lua_pushvalue(L, -2);
+		/* table, key, value key*/
+		append_buffer(L, buf, depth);
+		lua_pop(L, 1);
+
+		/* table, key, value */
+		append_buffer(L, buf, depth);
+		lua_pop(L, 1);
+		/* table, key */
+	}
+
+	if (is_cache) lua_pop(L, 1);
 }
 
 static void pack_array(lua_State * L, strbuf & buf, size_t len, int depth)
 {
-    if(len < 16) {
-        buf.push_back(CHAR(0x90 | len));
-    } else if(len < 65536) {
-        char sbuf[3];
-        store16(sbuf, 0xdc, len);
-        buf.append(sbuf, 3);
-    } else if(len < (1LL << 31)) {   // note: lua_rawgeti use int index
-        char sbuf[5];
-        store32(sbuf, 0xdd, len);
-        buf.append(sbuf, 5);
-    }else {
-		buf.destroy();
-		error(L, "exceeded maximum number of Array object(2^31 - 1):%d", len);
+	if (len < 16) {
+		buf.push_back(CHAR(0x90 | len));
 	}
-    for (size_t i = 1; i <= len; i++) {
-        lua_rawgeti(L, -1, i);
-        append_buffer(L, buf, depth);
-        lua_pop(L, 1);
-    }
+	else if (len < 65536) {
+		char sbuf[3];
+		store16(sbuf, 0xdc, len);
+		buf.append(sbuf, 3);
+	}
+	else if (len < (1LL << 31)) {   // note: lua_rawgeti use int index
+		char sbuf[5];
+		store32(sbuf, 0xdd, len);
+		buf.append(sbuf, 5);
+	}
+	else 
+		error(L, "exceeded maximum number of Array object(2^31 - 1):%d", len);
+	
+	int is_cache = 0;
+	lua_getfield(L, -1, "_data");
+	if (lua_type(L, -1) == LUA_TNIL)
+		lua_pop(L, 1);
+	else
+		is_cache = 1;
+
+	for (size_t i = 1; i <= len; i++) {
+		lua_rawgeti(L, -1, i);
+		append_buffer(L, buf, depth);
+		lua_pop(L, 1);
+	}
+
+	if (is_cache) lua_pop(L, 1);
+
 }
 
 // note: float to double have precision issus.
-static void pack_double(strbuf & buf, double x){
-    union { double f; uint64_t i; } mem;
-    mem.f = x;
-    char sbuf[9];
-    store64(sbuf, 0xcb, mem.i);
-    buf.append(sbuf, 9);
+static void pack_double(strbuf & buf, double x) {
+	union { double f; uint64_t i; } mem;
+	mem.f = x;
+	char sbuf[9];
+	store64(sbuf, 0xcb, mem.i);
+	buf.append(sbuf, 9);
 }
 
-static void pack_integer(strbuf & buf, int64_t d){
-    /*{
-        if (d >= -(1LL<<5) && d < (1<<7)){
-            buf.push_back(CHAR(d));        
-        }else if(d < 0 && d >= -(1<<7)){   
-            // signed 8
-            buf.push_back(CHAR(0xd0u));
-            buf.push_back(CHAR(d));
-        }else if(d >= -(1LL<<15) && d < (1LL << 15)){   // 0000 is 0 not 1, 1111 is -1, so negativ have one more number 
-            // signed 16
-            char sbuf[3];
-            sbuf[0] = CHAR(0xd1u); uint16_t be = _msgpack_be16(d); memcpy(sbuf + 1, &be, 2);
-            buf.append(sbuf, 3);
-        }else if(d >= -(1LL<<31) && d < (1LL<<31)){
-            // signed 32
-            char sbuf[5];
-            sbuf[0] = CHAR(0xd2u); uint32_t be = _msgpack_be32(d); memcpy(sbuf + 1, &be, 4);
-            buf.append(sbuf, 5);
-        }else{
-            // signed 64
-            char sbuf[9];
-            sbuf[0] = CHAR(0xd3u); uint64_t be = _msgpack_be64(d); memcpy(sbuf + 1, &be, 8);
-            buf.append(sbuf, 9);
-        }
-    }*/
-    if(d < -(1LL<<5)) { // d < -32
-        if(d < -(1LL<<15)) {    // d < -32768(0x8000)
-            if(d < -(1LL<<31)) {
-                /* signed 64 */
-                char sbuf[9];
-                store64(sbuf, 0xd3, d);
-                buf.append(sbuf, 9);
-            } else {
-                /* signed 32 */
-                char sbuf[5];
-                store32(sbuf, 0xd2, d);
-                buf.append(sbuf, 5);
-            }
-        } else {
-            if(d < -(1<<7)) {   // d < -128(0x80)
-                /* signed 16 */
-                char sbuf[3];
-                store16(sbuf, 0xd1, d);
-                buf.append(sbuf, 3);
-            } else {    // -128 <= d < -32
-                /* signed 8 */
-                buf.push_back(CHAR(0xd0));
-                buf.push_back(CHAR(d));
-            }
-        }
-    } else if(d < (1<<7)) { // -32 <= d < 128
-        /* fixnum */
-        buf.push_back(CHAR(d));
-    } else {
-        if(d < (1LL<<15)) {
-            /* signed 16 */
-            char sbuf[3];
-            store16(sbuf, 0xd1, d);
-            buf.append(sbuf, 3);
-        } else {
-            if(d < (1LL<<31)) {
-                /* signed 32 */
-                char sbuf[5];
-                store32(sbuf, 0xd2, d);
-                buf.append(sbuf, 5);
-            } else {
-                /* signed 64 */
-                char sbuf[9];
-                store64(sbuf, 0xd3, d);
-                buf.append(sbuf, 9);
-            }
-        }
-    }
+static void pack_integer(strbuf & buf, int64_t d) {
+	/*{
+	if (d >= -(1LL<<5) && d < (1<<7)){
+	buf.push_back(CHAR(d));
+	}else if(d < 0 && d >= -(1<<7)){
+	// signed 8
+	buf.push_back(CHAR(0xd0u));
+	buf.push_back(CHAR(d));
+	}else if(d >= -(1LL<<15) && d < (1LL << 15)){   // 0000 is 0 not 1, 1111 is -1, so negativ have one more number
+	// signed 16
+	char sbuf[3];
+	sbuf[0] = CHAR(0xd1u); uint16_t be = _msgpack_be16(d); memcpy(sbuf + 1, &be, 2);
+	buf.append(sbuf, 3);
+	}else if(d >= -(1LL<<31) && d < (1LL<<31)){
+	// signed 32
+	char sbuf[5];
+	sbuf[0] = CHAR(0xd2u); uint32_t be = _msgpack_be32(d); memcpy(sbuf + 1, &be, 4);
+	buf.append(sbuf, 5);
+	}else{
+	// signed 64
+	char sbuf[9];
+	sbuf[0] = CHAR(0xd3u); uint64_t be = _msgpack_be64(d); memcpy(sbuf + 1, &be, 8);
+	buf.append(sbuf, 9);
+	}
+	}*/
+	if (d < -(1LL << 5)) { // d < -32
+		if (d < -(1LL << 15)) {    // d < -32768(0x8000)
+			if (d < -(1LL << 31)) {
+				/* signed 64 */
+				char sbuf[9];
+				store64(sbuf, 0xd3, d);
+				buf.append(sbuf, 9);
+			}
+			else {
+				/* signed 32 */
+				char sbuf[5];
+				store32(sbuf, 0xd2, d);
+				buf.append(sbuf, 5);
+			}
+		}
+		else {
+			if (d < -(1 << 7)) {   // d < -128(0x80)
+								   /* signed 16 */
+				char sbuf[3];
+				store16(sbuf, 0xd1, d);
+				buf.append(sbuf, 3);
+			}
+			else {    // -128 <= d < -32
+					  /* signed 8 */
+				buf.push_back(CHAR(0xd0));
+				buf.push_back(CHAR(d));
+			}
+		}
+	}
+	else if (d < (1 << 7)) { // -32 <= d < 128
+							 /* fixnum */
+		buf.push_back(CHAR(d));
+	}
+	else {
+		if (d < (1LL << 15)) {
+			/* signed 16 */
+			char sbuf[3];
+			store16(sbuf, 0xd1, d);
+			buf.append(sbuf, 3);
+		}
+		else {
+			if (d < (1LL << 31)) {
+				/* signed 32 */
+				char sbuf[5];
+				store32(sbuf, 0xd2, d);
+				buf.append(sbuf, 5);
+			}
+			else {
+				/* signed 64 */
+				char sbuf[9];
+				store64(sbuf, 0xd3, d);
+				buf.append(sbuf, 9);
+			}
+		}
+	}
 }
 
-static size_t check_table(lua_State * L, bool & is_map){
-    size_t max = 0, n = 0;
-    double k = 0;
-    lua_pushnil(L);
-    /* table, nil */
-    while (lua_next(L, -2) != 0) {
-        /* table, key, value */
-        if (lua_type(L, -2) == LUA_TNUMBER && (k = lua_tonumber(L, -2)) 
-            && floor(k) == k && k >= 1) {
-            /* Integer >= 1 ? */
-            if (k > max) max = k;
-        }else
-            is_map = true;
-        n++;
-        lua_pop(L, 1);
-    }
+static size_t check_table(lua_State * L, bool & is_map) {
+	size_t max = 0, n = 0;
+	double k = 0;
 
-    /* sparse array */
-    if (max != n) is_map = true;
+	int is_cache = 0;
+	lua_getfield(L, -1, "_data");
+	if (lua_type(L, -1) == LUA_TNIL)
+		lua_pop(L, 1);
+	else
+		is_cache = 1;
 
-    // empty table as empty array
-    return n;
+	lua_pushnil(L);
+	/* table, nil */
+	while (lua_next(L, -2) != 0) {
+		/* table, key, value */
+		if (lua_type(L, -2) == LUA_TNUMBER && (k = lua_tonumber(L, -2))
+			&& floor(k) == k && k >= 1) {
+			/* Integer >= 1 ? */
+			if (k > max) max = k;
+		}
+		else
+			is_map = true;
+		n++;
+		lua_pop(L, 1);
+	}
+
+	/* sparse array */
+	if (max != n) is_map = true;
+
+	if (is_cache) lua_pop(L, 1);
+
+	// empty table as empty array
+	return n;
 }
 
-static void append_buffer(lua_State * L, strbuf & buf, int depth){
-    size_t len = 0;
-    double x = 0;
-    bool is_map = false;
-    switch (lua_type(L, -1)) {
-        case LUA_TNIL:
-            buf.push_back(CHAR(0xc0));
-            break;
-        case LUA_TBOOLEAN:
-            if (lua_toboolean(L, -1))
-                buf.push_back(CHAR(0xc3));
-            else
-                buf.push_back(CHAR(0xc2));
-            break;
-        case LUA_TSTRING:
-            pack_str(L, buf);
-            break;
-        case LUA_TNUMBER:
-            x = lua_tonumber(L, -1);
-            // nan != nan, inf == inf
-            if (floor(x) == x && !std::isinf(x))    // integer
-                pack_integer(buf, x);
-            else
-                pack_double(buf, x);
-            break;
-        case LUA_TTABLE:
-            if (++depth > max_depth || !lua_checkstack(L, 3)){
-                buf.destroy();                
-                error(L, "exceeded maximum nesting depth(%d)", max_depth);
-            }
-            len = check_table(L, is_map);
-            if (!is_map) 
-                pack_array(L, buf, len, depth);
-            else 
-                pack_map(L, buf, len, depth);
-            break;
-        default:
-            buf.destroy();        
-            error(L, "type not supported");
-    }
+static void append_buffer(lua_State * L, strbuf & buf, int depth) {
+	size_t len = 0;
+	double x = 0;
+	bool is_map = false;
+	switch (lua_type(L, -1)) {
+	case LUA_TNIL:
+		buf.push_back(CHAR(0xc0));
+		break;
+	case LUA_TBOOLEAN:
+		if (lua_toboolean(L, -1))
+			buf.push_back(CHAR(0xc3));
+		else
+			buf.push_back(CHAR(0xc2));
+		break;
+	case LUA_TSTRING:
+		pack_str(L, buf);
+		break;
+	case LUA_TNUMBER:
+		x = lua_tonumber(L, -1);
+		// nan != nan, inf == inf
+		if (floor(x) == x && !std::isinf(x))    // integer
+			pack_integer(buf, x);
+		else
+			pack_double(buf, x);
+		break;
+	case LUA_TTABLE:
+		if (++depth > MAX_DEPTH || !lua_checkstack(L, 3)) 
+			error(L, "exceeded maximum nesting depth(%d)", MAX_DEPTH);
+		
+		len = check_table(L, is_map);
+		if (!is_map)
+			pack_array(L, buf, len, depth);
+		else
+			pack_map(L, buf, len, depth);
+		break;
+	default:
+		error(L, "type not supported");
+	}
 }
 
-static int pack(lua_State * L){
-    luaL_argcheck(L, lua_gettop(L) == 1, 1, "expected 1 argument");
-    strbuf buf(L);    
-    append_buffer(L, buf, 0);
-    lua_pushlstring(L, buf.data(), buf.length());
-    return 1;
+static int pack(lua_State * L) {
+	luaL_argcheck(L, lua_gettop(L) == 1, 1, "expected 1 argument");
+	if (!REUSEBUF) {
+		strbuf buf(L);
+		append_buffer(L, buf, 0);
+		lua_pushlstring(L, buf.data(), buf.length());
+	}else {
+		strbuf * buf = get_strbuf(L);
+		buf->reset(L);
+		append_buffer(L, *buf, 0);
+		lua_pushlstring(L, buf->data(), buf->length());
+	}
+	return 1;
 }
 
 ////////////////unpack//////////////////
 
 void unpack_any(lua_State*, Parser&);
-    
-void unpack_array(lua_State * L, Parser& psr, size_t n){
-    if(++(psr.depth) > max_depth || !lua_checkstack(L, 2))
-        error(L, "exceeded maximum nesting depth(%d) at character %d", max_depth, psr.idx);
 
-    lua_newtable(L);
-    for(size_t i = 1; i <= n; i++){
-        unpack_any(L, psr);
-        lua_rawseti(L, -2, i);
-    }    
+void unpack_array(lua_State * L, Parser& psr, size_t n) {
+	if (++(psr.depth) > MAX_DEPTH || !lua_checkstack(L, 2))
+		error(L, "exceeded maximum nesting depth(%d) at character %d", MAX_DEPTH, psr.idx);
 
-    psr.depth--;
+	lua_newtable(L);
+	for (size_t i = 1; i <= n; i++) {
+		unpack_any(L, psr);
+		lua_rawseti(L, -2, i);
+	}
+
+	psr.depth--;
 }
-void unpack_map(lua_State * L, Parser& psr, size_t n){
-    if(++(psr.depth) > max_depth || !lua_checkstack(L, 3))
-        error(L, "exceeded maximum nesting depth(%d) at character %d", max_depth, psr.idx);
-    
-    lua_newtable(L);
-    while(n--){
-        unpack_any(L, psr);  // key
-        unpack_any(L, psr);  // value
-        lua_settable(L, -3);        
-    }  
+void unpack_map(lua_State * L, Parser& psr, size_t n) {
+	if (++(psr.depth) > MAX_DEPTH || !lua_checkstack(L, 3))
+		error(L, "exceeded maximum nesting depth(%d) at character %d", MAX_DEPTH, psr.idx);
 
-    psr.depth--;    
-}
+	lua_newtable(L);
+	while (n--) {
+		unpack_any(L, psr);  // key
+		unpack_any(L, psr);  // value
+		lua_settable(L, -3);
+	}
 
-void unpack_any(lua_State * L, Parser & psr){
-    uint8_t tag = 0;
-    read_byte(psr, tag);
-    union { double f; uint64_t i; } n;    
-    const char * str;
-    switch(tag) {
-    case 0xc0:  // nil
-        lua_pushnil(L); break;
-    case 0xc2:  // false
-        lua_pushboolean(L, 0); break;
-    case 0xc3:  // true
-        lua_pushboolean(L, 1); break;
-    case 0xd0:  // int 8
-        read_byte(psr, n.i); lua_pushnumber(L, CHAR(n.i)); break;
-    case 0xd1:  // int 16
-        load16(psr, n.i); lua_pushnumber(L, (int16_t)n.i); break;
-    case 0xd2:  // int 32
-        load32(psr, n.i); lua_pushnumber(L, (int32_t)n.i); break;
-    case 0xd3:  // int 64
-        load64(psr, n.i); lua_pushnumber(L, (int64_t)n.i); break;
-    case 0xcc:  // uint 8
-        read_byte(psr, n.i); lua_pushnumber(L, U8(n.i)); break;
-    case 0xcd:  // uint 16
-        load16(psr, n.i); lua_pushnumber(L, (uint16_t)n.i); break;
-    case 0xce:  // uint 32
-        load32(psr, n.i); lua_pushnumber(L, (uint32_t)n.i); break;
-    case 0xcf:  // uint 64
-        load64(psr, n.i); lua_pushnumber(L, (uint64_t)n.i); break;
-    case 0xca:  // float
-        { 
-            union{ float f; uint32_t i;} mem;
-            load32(psr, mem.i);
-            lua_pushnumber(L, mem.f);   // note: float to double have precision issue.
-            break;        
-        }
-    case 0xcb:  // double
-        load64(psr, n.i); lua_pushnumber(L, n.f); break;
-    case 0xd9:  // str 8
-        read_byte(psr, n.i); read_str(psr, n.i, str); lua_pushlstring(L, str, n.i); break;
-    case 0xda:  // str 16
-        load16(psr, n.i); read_str(psr, n.i, str); lua_pushlstring(L, str, n.i); break;
-    case 0xdb:  // str 32
-        load32(psr, n.i); read_str(psr, n.i, str); lua_pushlstring(L, str, n.i); break;
-    case 0xdc:  // array 16
-        load16(psr, n.i); unpack_array(L, psr, n.i); break;
-    case 0xdd:  // array 32
-        load32(psr, n.i); unpack_array(L, psr, n.i); break;
-    case 0xde:  // map 16
-        load16(psr, n.i); unpack_map(L, psr, n.i); break;
-    case 0xdf:  // map 32
-        load32(psr, n.i); unpack_map(L, psr, n.i); break;
-    default:    // mix in first byte
-        if ((tag & 0x80) == 0 || (tag & 0xe0) == 0xe0) {   // [-32, 128)
-            lua_pushnumber(L, CHAR(tag));
-        } else if ((tag & 0xe0) == 0xa0) {  // fixstr
-            n.i = tag & 0x1f; read_str(psr, n.i, str); lua_pushlstring(L, str, n.i);
-        } else if ((tag & 0xf0) == 0x80) {  // fixmap
-            n.i = tag & 0xf; unpack_map(L, psr, n.i);
-        } else if ((tag & 0xf0) == 0x90) {  // fixarray
-            n.i = tag & 0xf; unpack_array(L, psr, n.i);
-        } else {
-            error(L, "type not supported at character %d", psr.idx);
-        }
-    }
+	psr.depth--;
 }
 
-static int unpack(lua_State * L){
-    luaL_argcheck(L, lua_gettop(L) == 1, 1, "expected 1 argument");
-    luaL_argcheck(L, lua_type(L, 1) == LUA_TSTRING, 1, "expected string");
-    Parser psr;
-    psr.str = lua_tolstring(L, 1, &psr.len);
-    unpack_any(L, psr);
-    if(psr.idx != psr.len) error(L, "extra bytes left, starts at character %d", psr.idx);
-    return 1;    
+void unpack_any(lua_State * L, Parser & psr) {
+	uint8_t tag = 0;
+	read_byte(psr, tag);
+	union { double f; uint64_t i; } n;
+	const char * str;
+	switch (tag) {
+	case 0xc0:  // nil
+		lua_pushnil(L); break;
+	case 0xc2:  // false
+		lua_pushboolean(L, 0); break;
+	case 0xc3:  // true
+		lua_pushboolean(L, 1); break;
+	case 0xd0:  // int 8
+		read_byte(psr, n.i); lua_pushnumber(L, CHAR(n.i)); break;
+	case 0xd1:  // int 16
+		load16(psr, n.i); lua_pushnumber(L, (int16_t)n.i); break;
+	case 0xd2:  // int 32
+		load32(psr, n.i); lua_pushnumber(L, (int32_t)n.i); break;
+	case 0xd3:  // int 64
+		load64(psr, n.i); lua_pushnumber(L, (int64_t)n.i); break;
+	case 0xcc:  // uint 8
+		read_byte(psr, n.i); lua_pushnumber(L, U8(n.i)); break;
+	case 0xcd:  // uint 16
+		load16(psr, n.i); lua_pushnumber(L, (uint16_t)n.i); break;
+	case 0xce:  // uint 32
+		load32(psr, n.i); lua_pushnumber(L, (uint32_t)n.i); break;
+	case 0xcf:  // uint 64
+		load64(psr, n.i); lua_pushnumber(L, (uint64_t)n.i); break;
+	case 0xca:  // float
+	{
+		union { float f; uint32_t i; } mem;
+		load32(psr, mem.i);
+		lua_pushnumber(L, mem.f);   // note: float to double have precision issue.
+		break;
+	}
+	case 0xcb:  // double
+		load64(psr, n.i); lua_pushnumber(L, n.f); break;
+	case 0xd9:  // str 8
+		read_byte(psr, n.i); read_str(psr, n.i, str); lua_pushlstring(L, str, n.i); break;
+	case 0xda:  // str 16
+		load16(psr, n.i); read_str(psr, n.i, str); lua_pushlstring(L, str, n.i); break;
+	case 0xdb:  // str 32
+		load32(psr, n.i); read_str(psr, n.i, str); lua_pushlstring(L, str, n.i); break;
+	case 0xdc:  // array 16
+		load16(psr, n.i); unpack_array(L, psr, n.i); break;
+	case 0xdd:  // array 32
+		load32(psr, n.i); unpack_array(L, psr, n.i); break;
+	case 0xde:  // map 16
+		load16(psr, n.i); unpack_map(L, psr, n.i); break;
+	case 0xdf:  // map 32
+		load32(psr, n.i); unpack_map(L, psr, n.i); break;
+	default:    // mix in first byte
+		if ((tag & 0x80) == 0 || (tag & 0xe0) == 0xe0) {   // [-32, 128)
+			lua_pushnumber(L, CHAR(tag));
+		}
+		else if ((tag & 0xe0) == 0xa0) {  // fixstr
+			n.i = tag & 0x1f; read_str(psr, n.i, str); lua_pushlstring(L, str, n.i);
+		}
+		else if ((tag & 0xf0) == 0x80) {  // fixmap
+			n.i = tag & 0xf; unpack_map(L, psr, n.i);
+		}
+		else if ((tag & 0xf0) == 0x90) {  // fixarray
+			n.i = tag & 0xf; unpack_array(L, psr, n.i);
+		}
+		else {
+			error(L, "type not supported at character %d", psr.idx);
+		}
+	}
+}
+
+static int unpack(lua_State * L) {
+	luaL_argcheck(L, lua_gettop(L) == 1, 1, "expected 1 argument");
+	luaL_argcheck(L, lua_type(L, 1) == LUA_TSTRING, 1, "expected string");
+	Parser psr;
+	psr.str = lua_tolstring(L, 1, &psr.len);
+	unpack_any(L, psr);
+	if (psr.idx != psr.len) error(L, "extra bytes left, starts at character %d", psr.idx);
+	return 1;
 }
 
 static const luaL_Reg msgpack_funcs[] = {
-    {"pack", pack},
-    {"unpack", unpack},
-    {NULL, NULL}
+	{ "pack", pack },
+	{ "unpack", unpack },
+	{ NULL, NULL }
 };
 
+void create_strbuf(lua_State *L) {
+	strbuf *buf = (strbuf *)lua_newuserdata(L, sizeof(strbuf));
+	buf->init(L);
+	/* Create GC method to clean up strbuf */
+	lua_newtable(L);
+	lua_pushcfunction(L, destroy_strbuf);
+	// udata table func
+	lua_setfield(L, -2, "__gc");
+	// udata table
+	lua_setmetatable(L, -2);
+	// udata
+}
+
 extern "C" int luaopen_msgpack(lua_State *L){
-    lua_newtable(L);
-	luaL_setfuncs(L, msgpack_funcs, 0);
+	lua_newtable(L);
+	create_strbuf(L);	// strbuf as upval
+	luaL_setfuncs(L, msgpack_funcs, 1);
 	lua_setglobal(L, "msgpack");
     return 1;
 }
-
-
