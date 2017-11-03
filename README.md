@@ -16,7 +16,7 @@ below result comes from a simple test(loop a large table for 500 times)
 
                         encode          decode
 
-    lua-MessagePack      6.26            2.72
+    lua-MessagePack      2.72            6.26
 
     msgpack4lua          0.38            0.26
 
