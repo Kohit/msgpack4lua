@@ -39,7 +39,7 @@ extern "C" {
 
 #define CHAR(x) static_cast<char>(x)
 #define U8(x) static_cast<uint8_t>(x)
-#define REUSEBUF 1  // set 1 to enable reuse string buffer
+#define REUSEBUF 1  // set 0 to cancel reuse string buffer
 #define MAX_DEPTH 80
 #define DEFAULT_BUF_LENGTH 1024
 
@@ -266,13 +266,6 @@ static void pack_map(lua_State * L, strbuf & buf, size_t len, int depth)
 	}
 	else 
 		error(L, "exceeded maximum number of Array object(2^32 - 1):%d", len);
-	
-	int is_cache = 0;
-	lua_getfield(L, -1, "_data");
-	if (lua_type(L, -1) == LUA_TNIL)
-		lua_pop(L, 1);
-	else
-		is_cache = 1;
 
 	lua_pushnil(L);
 	/* table, nil */
@@ -288,8 +281,6 @@ static void pack_map(lua_State * L, strbuf & buf, size_t len, int depth)
 		lua_pop(L, 1);
 		/* table, key */
 	}
-
-	if (is_cache) lua_pop(L, 1);
 }
 
 static void pack_array(lua_State * L, strbuf & buf, size_t len, int depth)
@@ -309,22 +300,12 @@ static void pack_array(lua_State * L, strbuf & buf, size_t len, int depth)
 	}
 	else 
 		error(L, "exceeded maximum number of Array object(2^31 - 1):%d", len);
-	
-	int is_cache = 0;
-	lua_getfield(L, -1, "_data");
-	if (lua_type(L, -1) == LUA_TNIL)
-		lua_pop(L, 1);
-	else
-		is_cache = 1;
 
 	for (size_t i = 1; i <= len; i++) {
 		lua_rawgeti(L, -1, i);
 		append_buffer(L, buf, depth);
 		lua_pop(L, 1);
 	}
-
-	if (is_cache) lua_pop(L, 1);
-
 }
 
 // note: float to double have precision issus.
@@ -422,13 +403,6 @@ static size_t check_table(lua_State * L, bool & is_map) {
 	size_t max = 0, n = 0;
 	double k = 0;
 
-	int is_cache = 0;
-	lua_getfield(L, -1, "_data");
-	if (lua_type(L, -1) == LUA_TNIL)
-		lua_pop(L, 1);
-	else
-		is_cache = 1;
-
 	lua_pushnil(L);
 	/* table, nil */
 	while (lua_next(L, -2) != 0) {
@@ -446,8 +420,6 @@ static size_t check_table(lua_State * L, bool & is_map) {
 
 	/* sparse array */
 	if (max != n) is_map = true;
-
-	if (is_cache) lua_pop(L, 1);
 
 	// empty table as empty array
 	return n;
@@ -644,3 +616,5 @@ extern "C" int luaopen_msgpack(lua_State *L){
 	lua_setglobal(L, "msgpack");
     return 1;
 }
+
+
